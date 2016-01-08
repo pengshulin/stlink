@@ -28,7 +28,8 @@ int ugly_log(int level, const char *tag, const char *format, ...) {
     time_t mytt = time(NULL);
     struct tm *tt;
     tt = localtime(&mytt);
-    fprintf(stderr, "%d-%02d-%02dT%02d:%02d:%02d ", tt->tm_year + 1900, tt->tm_mon + 1, tt->tm_mday, tt->tm_hour, tt->tm_min, tt->tm_sec);
+    //fprintf(stderr, "%d-%02d-%02d %02d:%02d:%02d ", tt->tm_year + 1900, tt->tm_mon + 1, tt->tm_mday, tt->tm_hour, tt->tm_min, tt->tm_sec);
+    fprintf(stderr, "%02d:%02d:%02d ", tt->tm_hour, tt->tm_min, tt->tm_sec);
     switch (level) {
     case UDEBUG:
         fprintf(stderr, "DEBUG %s: ", tag);
