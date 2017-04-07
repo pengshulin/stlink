@@ -48,13 +48,32 @@ extern "C" {
 #define STLINK_JTAG_READDEBUG_32BIT 0x36
 #define STLINK_JTAG_DRIVE_NRST 0x3c
 
+#define STLINK_DEBUG_APIV2_SWD_SET_FREQ    0x43
+
     /* cortex core ids */
     // TODO clean this up...
 #define STM32VL_CORE_ID 0x1ba01477
+#define STM32F7_CORE_ID 0x5ba02477
 
     // Constant STM32 memory map figures
 #define STM32_FLASH_BASE 0x08000000
 #define STM32_SRAM_BASE 0x20000000
+
+// Baud rate divisors for SWDCLK
+#define STLINK_SWDCLK_4MHZ_DIVISOR		0
+#define STLINK_SWDCLK_1P8MHZ_DIVISOR	1
+#define STLINK_SWDCLK_1P2MHZ_DIVISOR	2
+#define STLINK_SWDCLK_950KHZ_DIVISOR	3
+#define STLINK_SWDCLK_480KHZ_DIVISOR	7
+#define STLINK_SWDCLK_240KHZ_DIVISOR	15
+#define STLINK_SWDCLK_125KHZ_DIVISOR	31
+#define STLINK_SWDCLK_100KHZ_DIVISOR	40
+#define STLINK_SWDCLK_50KHZ_DIVISOR		79
+#define STLINK_SWDCLK_25KHZ_DIVISOR		158
+#define STLINK_SWDCLK_15KHZ_DIVISOR		265
+#define STLINK_SWDCLK_5KHZ_DIVISOR		798
+
+
 
     /* Enough space to hold both a V2 command or a V1 command packaged as generic scsi*/
 #define C_BUF_LEN 32
@@ -67,7 +86,7 @@ extern "C" {
         STLINK_FLASH_TYPE_L4
     };
 
-    typedef struct {
+    struct stlink_reg {
         uint32_t r[16];
         uint32_t s[32];
         uint32_t xpsr;
@@ -80,7 +99,7 @@ extern "C" {
         uint8_t basepri;
         uint8_t primask;
         uint32_t fpscr;
-    } reg;
+    };
 
     typedef uint32_t stm32_addr_t;
 
@@ -166,20 +185,25 @@ typedef struct flash_loader {
     int stlink_write_debug32(stlink_t *sl, uint32_t addr, uint32_t data);
     int stlink_write_mem32(stlink_t *sl, uint32_t addr, uint16_t len);
     int stlink_write_mem8(stlink_t *sl, uint32_t addr, uint16_t len);
-    int stlink_read_all_regs(stlink_t *sl, reg *regp);
-    int stlink_read_all_unsupported_regs(stlink_t *sl, reg *regp);
-    int stlink_read_reg(stlink_t *sl, int r_idx, reg *regp);
-    int stlink_read_unsupported_reg(stlink_t *sl, int r_idx, reg *regp);
-    int stlink_write_unsupported_reg(stlink_t *sl, uint32_t value, int r_idx, reg *regp);
+    int stlink_read_all_regs(stlink_t *sl, struct stlink_reg *regp);
+    int stlink_read_all_unsupported_regs(stlink_t *sl, struct stlink_reg *regp);
+    int stlink_read_reg(stlink_t *sl, int r_idx, struct stlink_reg *regp);
+    int stlink_read_unsupported_reg(stlink_t *sl, int r_idx, struct stlink_reg *regp);
+    int stlink_write_unsupported_reg(stlink_t *sl, uint32_t value, int r_idx, struct stlink_reg *regp);
     int stlink_write_reg(stlink_t *sl, uint32_t reg, int idx);
     int stlink_step(stlink_t *sl);
     int stlink_current_mode(stlink_t *sl);
     int stlink_force_debug(stlink_t *sl);
     int stlink_target_voltage(stlink_t *sl);
+    int stlink_set_swdclk(stlink_t *sl, uint16_t divisor);
 
     int stlink_erase_flash_mass(stlink_t* sl);
     int stlink_write_flash(stlink_t* sl, stm32_addr_t address, uint8_t* data, uint32_t length, uint8_t eraseonly);
+    int stlink_parse_ihex(const char* path, uint8_t erased_pattern, uint8_t * * mem, size_t * size, uint32_t * begin);
+    uint8_t stlink_get_erased_pattern(stlink_t *sl);
+    int stlink_mwrite_flash(stlink_t *sl, uint8_t* data, uint32_t length, stm32_addr_t addr);
     int stlink_fwrite_flash(stlink_t *sl, const char* path, stm32_addr_t addr);
+    int stlink_mwrite_sram(stlink_t *sl, uint8_t* data, uint32_t length, stm32_addr_t addr);
     int stlink_fwrite_sram(stlink_t *sl, const char* path, stm32_addr_t addr);
     int stlink_verify_write_flash(stlink_t *sl, stm32_addr_t address, uint8_t *data, uint32_t length);
 
@@ -198,7 +222,7 @@ typedef struct flash_loader {
     bool stlink_is_core_halted(stlink_t *sl);
     int write_buffer_to_sram(stlink_t *sl, flash_loader_t* fl, const uint8_t* buf, size_t size);
     int write_loader_to_sram(stlink_t *sl, stm32_addr_t* addr, size_t* size);
-    int stlink_fread(stlink_t* sl, const char* path, stm32_addr_t addr, size_t size);
+    int stlink_fread(stlink_t* sl, const char* path, bool is_ihex, stm32_addr_t addr, size_t size);
     int stlink_load_device_params(stlink_t *sl);
 
 #include "stlink/sg.h"
@@ -207,6 +231,7 @@ typedef struct flash_loader {
 #include "stlink/commands.h"
 #include "stlink/chipid.h"
 #include "stlink/flash_loader.h"
+#include "stlink/version.h"
 
 #ifdef __cplusplus
 }

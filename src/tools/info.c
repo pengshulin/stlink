@@ -7,6 +7,7 @@
 
 static void usage(void)
 {
+    puts("st-info --version");
     puts("st-info --flash");
     puts("st-info --sram");
     puts("st-info --descr");
@@ -49,8 +50,10 @@ static void stlink_print_info(stlink_t *sl)
     printf("openocd: ");
     stlink_print_serial(sl, true);
 
-    printf("  flash: %zu (pagesize: %zu)\n", sl->flash_size, sl->flash_pgsz);
-    printf("   sram: %zu\n",       sl->sram_size);
+    printf("  flash: %u (pagesize: %u)\n",
+	   (unsigned int)sl->flash_size, (unsigned int)sl->flash_pgsz);
+
+    printf("   sram: %u\n",       (unsigned int)sl->sram_size);
     printf(" chipid: 0x%.4x\n",    sl->chip_id);
 
 	params = stlink_chipid_get_params(sl->chip_id);
@@ -65,7 +68,7 @@ static void stlink_probe(void)
 
     size = stlink_probe_usb(&stdevs);
 
-    printf("Found %zu stlink programmers\n", size);
+    printf("Found %u stlink programmers\n", (unsigned int)size);
 
     for (size_t n = 0; n < size; n++)
         stlink_print_info(stdevs[n]);
@@ -91,6 +94,9 @@ static int print_data(char **av)
     if (strcmp(av[1], "--probe") == 0) {
         stlink_probe();
         return 0;
+    } else if (strcmp(av[1], "--version") == 0) {
+        printf("v%s\n", STLINK_VERSION);
+        return 0;
     }
 
     sl = stlink_open_first();
@@ -108,11 +114,11 @@ static int print_data(char **av)
         stlink_enter_swd_mode(sl);
 
     if (strcmp(av[1], "--flash") == 0)
-        printf("0x%zx\n", sl->flash_size);
+        printf("0x%x\n", (unsigned int)sl->flash_size);
     else if (strcmp(av[1], "--sram") == 0)
-        printf("0x%zx\n", sl->sram_size);
+        printf("0x%x\n", (unsigned int)sl->sram_size);
     else if (strcmp(av[1], "--pagesize") == 0)
-        printf("0x%zx\n", sl->flash_pgsz);
+        printf("0x%x\n", (unsigned int)sl->flash_pgsz);
     else if (strcmp(av[1], "--chipid") == 0)
         printf("0x%.4x\n", sl->chip_id);
     else if (strcmp(av[1], "--serial") == 0)

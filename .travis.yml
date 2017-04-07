@@ -1,33 +1,24 @@
 sudo: true
 language: c
+compiler:
+  - gcc
+  - clang
+os:
+  - linux
+  - osx
 addons:
   apt:
     sources:
-      - llvm-toolchain-precise-3.8
+#      - llvm-toolchain-precise-3.8
       - ubuntu-toolchain-r-test
     packages:
-      - clang-3.8
+      - clang
+#      - clang-3.8
       - g++-5
       - gcc-5
+      - libusb-1.0.0-dev
 script:
+  - git fetch --tags
+  - printenv
+  - cmake --version
   - ./.travis.sh
-matrix:
-  include:
-    - os: linux
-      compiler: gcc
-      env: "BUILD_SYSTEM=autotools"
-    - os: linux
-      compiler: clang
-      env: "BUILD_SYSTEM=autotools"
-    - os: linux
-      compiler: gcc-5
-      env: "BUILD_SYSTEM=cmake"
-    - os: linux
-      compiler: clang-3.8
-      env: "BUILD_SYSTEM=cmake"
-    - os: osx
-      compiler: clang
-      env: "BUILD_SYSTEM=cmake"
-    - os: osx
-      compiler: clang
-      env: "BUILD_SYSTEM=autotools"

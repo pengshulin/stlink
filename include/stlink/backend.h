@@ -18,16 +18,17 @@
         int (*write_debug32) (stlink_t *sl, uint32_t addr, uint32_t data);
         int (*write_mem32) (stlink_t *sl, uint32_t addr, uint16_t len);
         int (*write_mem8) (stlink_t *sl, uint32_t addr, uint16_t len);
-        int (*read_all_regs) (stlink_t *sl, reg * regp);
-        int (*read_reg) (stlink_t *sl, int r_idx, reg * regp);
-        int (*read_all_unsupported_regs) (stlink_t *sl, reg *regp);
-        int (*read_unsupported_reg) (stlink_t *sl, int r_idx, reg *regp);
-        int (*write_unsupported_reg) (stlink_t *sl, uint32_t value, int idx, reg *regp);
+        int (*read_all_regs) (stlink_t *sl, struct stlink_reg * regp);
+        int (*read_reg) (stlink_t *sl, int r_idx, struct stlink_reg * regp);
+        int (*read_all_unsupported_regs) (stlink_t *sl, struct stlink_reg *regp);
+        int (*read_unsupported_reg) (stlink_t *sl, int r_idx, struct stlink_reg *regp);
+        int (*write_unsupported_reg) (stlink_t *sl, uint32_t value, int idx, struct stlink_reg *regp);
         int (*write_reg) (stlink_t *sl, uint32_t reg, int idx);
         int (*step) (stlink_t * stl);
         int (*current_mode) (stlink_t * stl);
         int (*force_debug) (stlink_t *sl);
         int32_t (*target_voltage) (stlink_t *sl);
+        int (*set_swdclk) (stlink_t * stl, uint16_t divisor);		
     } stlink_backend_t;
 
 #endif /* STLINK_BACKEND_H_ */

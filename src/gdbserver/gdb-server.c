@@ -3,17 +3,17 @@
  * Use of this source code is governed by a BSD-style
  * license that can be found in the LICENSE file.
  */
-
+#include <ctype.h>
 #include <getopt.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <sys/types.h>
 #ifdef __MINGW32__
-#include "mingw.h"
+#include <mingw.h>
 #else
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -24,13 +24,21 @@
 
 #include "gdb-remote.h"
 #include "gdb-server.h"
+#include "semihosting.h"
 
 #define FLASH_BASE 0x08000000
+
+/* Semihosting doesn't have a short option, we define a value to identify it */
+#define SEMIHOSTING_OPTION 128
+#define SERIAL_OPTION 127
 
 //Allways update the FLASH_PAGE before each use, by calling stlink_calculate_pagesize
 #define FLASH_PAGE (sl->flash_pgsz)
 
-stlink_t *connected_stlink = NULL;
+static stlink_t *connected_stlink = NULL;
+static bool semihosting = false;
+static bool serial_specified = false;
+static char serialnumber[28] = {0};
 
 static const char hex[] = "0123456789abcdef";
 
@@ -50,7 +58,9 @@ int serve(stlink_t *sl, st_state_t *st);
 char* make_memory_map(stlink_t *sl);
 static void init_cache (stlink_t *sl);
 
-static void cleanup(int signal __attribute__((unused))) {
+static void cleanup(int signum) {
+	(void)signum;
+
     if (connected_stlink) {
         /* Switch back to mass storage mode before closing. */
         stlink_run(connected_stlink);
@@ -62,6 +72,24 @@ static void cleanup(int signal __attribute__((unused))) {
 }
 
 
+static stlink_t* do_connect(st_state_t *st) {
+    stlink_t *ret = NULL;
+    switch (st->stlink_version) {
+        case 2:
+            if(serial_specified){
+                ret = stlink_open_usb(st->logging_level, st->reset, serialnumber);
+            }
+            else{
+                ret = stlink_open_usb(st->logging_level, st->reset, NULL);
+            }
+            break;
+        case 1:
+            ret = stlink_v1_open(st->logging_level, st->reset);
+            break;
+    }
+    return ret;
+}
+
 
 int parse_options(int argc, char** argv, st_state_t *st) {
     static struct option long_options[] = {
@@ -72,10 +100,14 @@ int parse_options(int argc, char** argv, st_state_t *st) {
         {"listen_port", required_argument, NULL, 'p'},
         {"multi", optional_argument, NULL, 'm'},
         {"no-reset", optional_argument, NULL, 'n'},
+        {"version", no_argument, NULL, 'V'},
+        {"semihosting", no_argument, NULL, SEMIHOSTING_OPTION},
+	  {"serial", required_argument, NULL, SERIAL_OPTION},
         {0, 0, 0, 0},
     };
     const char * help_str = "%s - usage:\n\n"
         "  -h, --help\t\tPrint this help\n"
+        "  -V, --version\t\tPrint the version\n"
         "  -vXX, --verbose=XX\tSpecify a specific verbosity level (0..99)\n"
         "  -v, --verbose\t\tSpecify generally verbose logging\n"
         "  -s X, --stlink_version=X\n"
@@ -89,6 +121,10 @@ int parse_options(int argc, char** argv, st_state_t *st) {
         "\t\t\tst-util will continue listening for connections after disconnect.\n"
         "  -n, --no-reset\n"
         "\t\t\tDo not reset board on connection.\n"
+        "  --semihosting\n"
+        "\t\t\tEnable semihosting support.\n"
+        "  --serial <serial>\n"
+        "\t\t\tUse a specific serial number.\n"
         "\n"
         "The STLINKv2 device to use can be specified in the environment\n"
         "variable STLINK_DEVICE on the format <USB_BUS>:<USB_ADDR>.\n"
@@ -102,12 +138,6 @@ int parse_options(int argc, char** argv, st_state_t *st) {
     while ((c = getopt_long(argc, argv, "hv::s:1p:mn", long_options, &option_index)) != -1) {
         switch (c) {
             case 0:
-                printf("XXXXX Shouldn't really normally come here, only if there's no corresponding option\n");
-                printf("option %s", long_options[option_index].name);
-                if (optarg) {
-                    printf(" with arg %s", optarg);
-                }
-                printf("\n");
                 break;
             case 'h':
                 printf(help_str, argv[0]);
@@ -145,6 +175,25 @@ int parse_options(int argc, char** argv, st_state_t *st) {
             case 'n':
                 st->reset = 0;
                 break;
+            case 'V':
+                printf("v%s\n", STLINK_VERSION);
+                exit(EXIT_SUCCESS);
+            case SEMIHOSTING_OPTION:
+                semihosting = true;
+                break;
+            case SERIAL_OPTION:
+                printf("use serial %s\n",optarg);
+                            /** @todo This is not really portable, as strlen really returns size_t we need to obey and not cast it to a signed type. */
+                int j = (int)strlen(optarg);
+                int length = j / 2;  //the length of the destination-array
+                if(j % 2 != 0) return -1;
+                for(size_t k = 0; j >= 0 && k < sizeof(serialnumber); ++k, j -= 2) {
+                    char buffer[3] = {0};
+                    memcpy(buffer, optarg + j, 2);
+                    serialnumber[length - k] = (uint8_t)strtol(buffer, NULL, 16);
+                }
+                serial_specified = true;
+                break;
         }
     }
 
@@ -157,30 +206,22 @@ int parse_options(int argc, char** argv, st_state_t *st) {
     return 0;
 }
 
-
 int main(int argc, char** argv) {
-    int32_t voltage;
-
     stlink_t *sl = NULL;
-
     st_state_t state;
     memset(&state, 0, sizeof(state));
+
     // set defaults...
     state.stlink_version = 2;
     state.logging_level = DEFAULT_LOGGING_LEVEL;
     state.listen_port = DEFAULT_GDB_LISTEN_PORT;
     state.reset = 1;    /* By default, reset board */
     parse_options(argc, argv, &state);
-    switch (state.stlink_version) {
-        case 2:
-            sl = stlink_open_usb(state.logging_level, state.reset, NULL);
-            if(sl == NULL) return 1;
-            break;
-        case 1:
-            sl = stlink_v1_open(state.logging_level, state.reset);
-            if(sl == NULL) return 1;
-            break;
-    }
+
+    printf("st-util %s\n", STLINK_VERSION);
+
+    sl = do_connect(&state);
+    if(sl == NULL) return 1;
 
     connected_stlink = sl;
     signal(SIGINT, &cleanup);
@@ -191,15 +232,11 @@ int main(int argc, char** argv) {
         stlink_reset(sl);
     }
 
+
+
     ILOG("Chip ID is %08x, Core ID is  %08x.\n", sl->chip_id, sl->core_id);
 
-    voltage = stlink_target_voltage(sl);
-    if (voltage != -1) {
-        ILOG("Target voltage is %d mV.\n", voltage);
-    }
-
     sl->verbose=0;
-
     current_memory_map = make_memory_map(sl);
 
 #ifdef __MINGW32__
@@ -215,6 +252,9 @@ int main(int argc, char** argv) {
         if (serve(sl, &state)) {
 	  sleep (1); // don't go bezurk if serve returns with error
 	}
+
+        /* in case serve() changed the connection */
+        sl = connected_stlink;
 
         /* Continue */
         stlink_run(sl);
@@ -353,20 +393,20 @@ static const char* const memory_map_template_F2 =
     "<!DOCTYPE memory-map PUBLIC \"+//IDN gnu.org//DTD GDB Memory Map V1.0//EN\""
     "     \"http://sourceware.org/gdb/gdb-memory-map.dtd\">"
     "<memory-map>"
-    "  <memory type=\"rom\" start=\"0x00000000\" length=\"0x%zx\"/>"        // code = sram, bootrom or flash; flash is bigger
-    "  <memory type=\"ram\" start=\"0x20000000\" length=\"0x%zx\"/>"        // sram
+    "  <memory type=\"rom\" start=\"0x00000000\" length=\"0x%x\"/>"        // code = sram, bootrom or flash; flash is bigger
+    "  <memory type=\"ram\" start=\"0x20000000\" length=\"0x%x\"/>"        // sram
     "  <memory type=\"flash\" start=\"0x08000000\" length=\"0x10000\">"     //Sectors 0..3
     "    <property name=\"blocksize\">0x4000</property>"                    //16kB
     "  </memory>"
     "  <memory type=\"flash\" start=\"0x08010000\" length=\"0x10000\">"     //Sector 4
     "    <property name=\"blocksize\">0x10000</property>"                   //64kB
     "  </memory>"
-    "  <memory type=\"flash\" start=\"0x08020000\" length=\"0x%zx\">"       //Sectors 5..
+    "  <memory type=\"flash\" start=\"0x08020000\" length=\"0x%x\">"       //Sectors 5..
     "    <property name=\"blocksize\">0x20000</property>"                   //128kB
     "  </memory>"
     "  <memory type=\"ram\" start=\"0x40000000\" length=\"0x1fffffff\"/>"   // peripheral regs
     "  <memory type=\"ram\" start=\"0xe0000000\" length=\"0x1fffffff\"/>"   // cortex regs
-    "  <memory type=\"rom\" start=\"0x%08x\" length=\"0x%zx\"/>"            // bootrom
+    "  <memory type=\"rom\" start=\"0x%08x\" length=\"0x%x\"/>"            // bootrom
     "  <memory type=\"rom\" start=\"0x1fffc000\" length=\"0x10\"/>"         // option byte area
     "</memory-map>";
 
@@ -375,10 +415,10 @@ static const char* const memory_map_template_L4 =
     "<!DOCTYPE memory-map PUBLIC \"+//IDN gnu.org//DTD GDB Memory Map V1.0//EN\""
     "     \"http://sourceware.org/gdb/gdb-memory-map.dtd\">"
     "<memory-map>"
-    "  <memory type=\"rom\" start=\"0x00000000\" length=\"0x%zx\"/>"        // code = sram, bootrom or flash; flash is bigger
+    "  <memory type=\"rom\" start=\"0x00000000\" length=\"0x%x\"/>"        // code = sram, bootrom or flash; flash is bigger
     "  <memory type=\"ram\" start=\"0x10000000\" length=\"0x8000\"/>"       // SRAM2 (32 KB)
     "  <memory type=\"ram\" start=\"0x20000000\" length=\"0x18000\"/>"      // SRAM1 (96 KB)
-    "  <memory type=\"flash\" start=\"0x08000000\" length=\"0x%zx\">"
+    "  <memory type=\"flash\" start=\"0x08000000\" length=\"0x%x\">"
     "    <property name=\"blocksize\">0x800</property>"
     "  </memory>"
     "  <memory type=\"ram\" start=\"0x40000000\" length=\"0x1fffffff\"/>"   // peripheral regs
@@ -394,14 +434,14 @@ static const char* const memory_map_template =
     "<!DOCTYPE memory-map PUBLIC \"+//IDN gnu.org//DTD GDB Memory Map V1.0//EN\""
     "     \"http://sourceware.org/gdb/gdb-memory-map.dtd\">"
     "<memory-map>"
-    "  <memory type=\"rom\" start=\"0x00000000\" length=\"0x%zx\"/>"        // code = sram, bootrom or flash; flash is bigger
-    "  <memory type=\"ram\" start=\"0x20000000\" length=\"0x%zx\"/>"        // sram 8k
-    "  <memory type=\"flash\" start=\"0x08000000\" length=\"0x%zx\">"
-    "    <property name=\"blocksize\">0x%zx</property>"
+    "  <memory type=\"rom\" start=\"0x00000000\" length=\"0x%x\"/>"        // code = sram, bootrom or flash; flash is bigger
+    "  <memory type=\"ram\" start=\"0x20000000\" length=\"0x%x\"/>"        // sram 8k
+    "  <memory type=\"flash\" start=\"0x08000000\" length=\"0x%x\">"
+    "    <property name=\"blocksize\">0x%x</property>"
     "  </memory>"
     "  <memory type=\"ram\" start=\"0x40000000\" length=\"0x1fffffff\"/>"   // peripheral regs
     "  <memory type=\"ram\" start=\"0xe0000000\" length=\"0x1fffffff\"/>"   // cortex regs
-    "  <memory type=\"rom\" start=\"0x%08x\" length=\"0x%zx\"/>"            // bootrom
+    "  <memory type=\"rom\" start=\"0x%08x\" length=\"0x%x\"/>"            // bootrom
     "  <memory type=\"rom\" start=\"0x1ffff800\" length=\"0x10\"/>"         // option byte area
     "</memory-map>";
 
@@ -412,7 +452,7 @@ static const char* const memory_map_template_F7 =
     "<memory-map>"
     "  <memory type=\"ram\" start=\"0x00000000\" length=\"0x4000\"/>"       // ITCM ram 16kB
     "  <memory type=\"rom\" start=\"0x00200000\" length=\"0x100000\"/>"     // ITCM flash
-    "  <memory type=\"ram\" start=\"0x20000000\" length=\"0x50000\"/>"      // sram
+    "  <memory type=\"ram\" start=\"0x20000000\" length=\"0x%x\"/>"      // sram
     "  <memory type=\"flash\" start=\"0x08000000\" length=\"0x20000\">"     // Sectors 0..3
     "    <property name=\"blocksize\">0x8000</property>"                    // 32kB
     "  </memory>"
@@ -429,32 +469,60 @@ static const char* const memory_map_template_F7 =
     "  <memory type=\"rom\" start=\"0x1fff0000\" length=\"0x20\"/>"         // option byte area
     "</memory-map>";
 
+
+static const char* const memory_map_template_F4_DE =
+    "<?xml version=\"1.0\"?>"
+    "<!DOCTYPE memory-map PUBLIC \"+//IDN gnu.org//DTD GDB Memory Map V1.0//EN\""
+    "     \"http://sourceware.org/gdb/gdb-memory-map.dtd\">"
+    "<memory-map>"
+    "  <memory type=\"rom\" start=\"0x00000000\" length=\"0x80000\"/>"      // code = sram, bootrom or flash; flash is bigger
+    "  <memory type=\"ram\" start=\"0x20000000\" length=\"0x18000\"/>"      // sram
+    "  <memory type=\"flash\" start=\"0x08000000\" length=\"0x10000\">"     //Sectors 0..3
+    "    <property name=\"blocksize\">0x4000</property>"                    //16kB
+    "  </memory>"
+    "  <memory type=\"flash\" start=\"0x08010000\" length=\"0x10000\">"     //Sector 4
+    "    <property name=\"blocksize\">0x10000</property>"                   //64kB
+    "  </memory>"
+    "  <memory type=\"flash\" start=\"0x08020000\" length=\"0x60000\">"     //Sectors 5..7
+    "    <property name=\"blocksize\">0x20000</property>"                   //128kB
+    "  </memory>"
+    "  <memory type=\"ram\" start=\"0x40000000\" length=\"0x1fffffff\"/>"   // peripheral regs
+    "  <memory type=\"ram\" start=\"0xe0000000\" length=\"0x1fffffff\"/>"   // cortex regs
+    "  <memory type=\"rom\" start=\"0x1fff0000\" length=\"0x7800\"/>"       // bootrom
+    "  <memory type=\"rom\" start=\"0x1fff7800\" length=\"0x210\"/>"        // otp
+    "  <memory type=\"rom\" start=\"0x1fffc000\" length=\"0x10\"/>"         // option byte area
+    "</memory-map>";
+
 char* make_memory_map(stlink_t *sl) {
     /* This will be freed in serve() */
-    char* map = malloc(4096);
+    const size_t sz = 4096;
+    char* map = malloc(sz);
     map[0] = '\0';
 
     if(sl->chip_id==STLINK_CHIPID_STM32_F4 || sl->chip_id==STLINK_CHIPID_STM32_F446) {
         strcpy(map, memory_map_template_F4);
-    } else if(sl->chip_id==STLINK_CHIPID_STM32_F4 || sl->chip_id==STLINK_CHIPID_STM32_F7) {
-        strcpy(map, memory_map_template_F7);
+    } else if(sl->chip_id==STLINK_CHIPID_STM32_F4_DE) {
+        strcpy(map, memory_map_template_F4_DE);
+    } else if(sl->core_id==STM32F7_CORE_ID) {
+        snprintf(map, sz, memory_map_template_F7,
+                (unsigned int)sl->sram_size);
     } else if(sl->chip_id==STLINK_CHIPID_STM32_F4_HD) {
         strcpy(map, memory_map_template_F4_HD);
     } else if(sl->chip_id==STLINK_CHIPID_STM32_F2) {
-        snprintf(map, 4096, memory_map_template_F2,
-                sl->flash_size,
-                sl->sram_size,
-                sl->flash_size - 0x20000,
-                sl->sys_base, sl->sys_size);
+        snprintf(map, sz, memory_map_template_F2,
+                (unsigned int)sl->flash_size,
+                (unsigned int)sl->sram_size,
+                (unsigned int)sl->flash_size - 0x20000,
+                (unsigned int)sl->sys_base, (unsigned int)sl->sys_size);
     } else if(sl->chip_id==STLINK_CHIPID_STM32_L4) {
-        snprintf(map, 4096, memory_map_template_L4,
-                sl->flash_size, sl->flash_size);
+        snprintf(map, sz, memory_map_template_L4,
+                (unsigned int)sl->flash_size, (unsigned int)sl->flash_size);
     } else {
-        snprintf(map, 4096, memory_map_template,
-                sl->flash_size,
-                sl->sram_size,
-                sl->flash_size, sl->flash_pgsz,
-                sl->sys_base, sl->sys_size);
+        snprintf(map, sz, memory_map_template,
+                (unsigned int)sl->flash_size,
+                (unsigned int)sl->sram_size,
+                (unsigned int)sl->flash_size, (unsigned int)sl->flash_pgsz,
+                (unsigned int)sl->sys_base, (unsigned int)sl->sys_size);
     }
     return map;
 }
@@ -485,7 +553,7 @@ struct code_hw_watchpoint {
     enum watchfun fun;
 };
 
-struct code_hw_watchpoint data_watches[DATA_WATCH_NUM];
+static struct code_hw_watchpoint data_watches[DATA_WATCH_NUM];
 
 static void init_data_watchpoints(stlink_t *sl) {
     uint32_t data;
@@ -569,8 +637,8 @@ static int delete_data_watchpoint(stlink_t *sl, stm32_addr_t addr)
     return -1;
 }
 
-int code_break_num;
-int code_lit_num;
+static int code_break_num;
+static int code_lit_num;
 #define CODE_BREAK_NUM_MAX	15
 #define CODE_BREAK_LOW	0x01
 #define CODE_BREAK_HIGH	0x02
@@ -580,7 +648,7 @@ struct code_hw_breakpoint {
     int          type;
 };
 
-struct code_hw_breakpoint code_breaks[CODE_BREAK_NUM_MAX];
+static struct code_hw_breakpoint code_breaks[CODE_BREAK_NUM_MAX];
 
 static void init_code_breakpoints(stlink_t *sl) {
     unsigned int val;
@@ -598,6 +666,16 @@ static void init_code_breakpoints(stlink_t *sl) {
     }
 }
 
+static int has_breakpoint(stm32_addr_t addr)
+{
+    for(int i = 0; i < code_break_num; i++) {
+        if (code_breaks[i].addr == addr) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int update_code_breakpoint(stlink_t *sl, stm32_addr_t addr, int set) {
     stm32_addr_t fpb_addr;
     uint32_t mask;
@@ -608,7 +686,7 @@ static int update_code_breakpoint(stlink_t *sl, stm32_addr_t addr, int set) {
         return -1;
     }
 
-	if (sl->chip_id==STLINK_CHIPID_STM32_F7) {
+	if (sl->core_id==STM32F7_CORE_ID) {
 		fpb_addr = addr;
 	} else {
 		fpb_addr = addr & ~0x3;
@@ -628,29 +706,29 @@ static int update_code_breakpoint(stlink_t *sl, stm32_addr_t addr, int set) {
         else	return 0;  // Breakpoint is already removed
     }
 
-    struct code_hw_breakpoint* brk = &code_breaks[id];
+    struct code_hw_breakpoint* bp = &code_breaks[id];
 
-    brk->addr = fpb_addr;
+    bp->addr = fpb_addr;
 
-	if (sl->chip_id==STLINK_CHIPID_STM32_F7) {
-		if(set) brk->type = type;
-		else	brk->type = 0;
+	if (sl->core_id==STM32F7_CORE_ID) {
+		if(set) bp->type = type;
+		else	bp->type = 0;
 
-		mask = (brk->addr) | 1;
+		mask = (bp->addr) | 1;
 	} else {
-		if(set) brk->type |= type;
-		else	brk->type &= ~type;
+		if(set) bp->type |= type;
+		else	bp->type &= ~type;
 
-		mask = (brk->addr) | 1 | (brk->type << 30);
+		mask = (bp->addr) | 1 | (bp->type << 30);
 	}
 
-    if(brk->type == 0) {
+    if(bp->type == 0) {
         DLOG("clearing hw break %d\n", id);
 
         stlink_write_debug32(sl, 0xe0002008 + id * 4, 0);
     } else {
         DLOG("setting hw break %d at %08x (%d)\n",
-                    id, brk->addr, brk->type);
+                    id, bp->addr, bp->type);
         DLOG("reg %08x \n",
                     mask);
 
@@ -753,12 +831,11 @@ static int flash_go(stlink_t *sl) {
             stlink_calculate_pagesize(sl, page);
 
             DLOG("flash_do: page %08x\n", page);
-            unsigned send = length > FLASH_PAGE ? FLASH_PAGE : length;
-            if(stlink_write_flash(sl, page, fb->data + (page - fb->addr),
-                        send, 0) < 0)
+            unsigned len = (length > FLASH_PAGE) ? (unsigned int) FLASH_PAGE : length;
+            int ret = stlink_write_flash(sl, page, fb->data + (page - fb->addr), len, 0);
+            if (ret < 0)
                 goto error;
-            length -= send;
-            
+            length -= len;
         }
     }
 
@@ -842,7 +919,7 @@ static void init_cache (stlink_t *sl) {
   int i;
 
   /* Assume only F7 has a cache.  */
-  if(sl->chip_id!=STLINK_CHIPID_STM32_F7)
+  if(sl->core_id!=STM32F7_CORE_ID)
     return;
 
   stlink_read_debug32(sl, CLIDR, &clidr);
@@ -923,7 +1000,7 @@ static void cache_sync(stlink_t *sl)
 {
   unsigned ccr;
 
-  if(sl->chip_id!=STLINK_CHIPID_STM32_F7)
+  if(sl->core_id!=STM32F7_CORE_ID)
     return;
   if (!cache_modified)
     return;
@@ -932,6 +1009,21 @@ static void cache_sync(stlink_t *sl)
   stlink_read_debug32(sl, CCR, &ccr);
   if (ccr & (CCR_IC | CCR_DC))
     cache_flush(sl, ccr);
+}
+
+static size_t unhexify(const char *in, char *out, size_t out_count)
+{
+    size_t i;
+    unsigned int c;
+
+    for (i = 0; i < out_count; i++) {
+        if (sscanf(in + (2 * i), "%02x", &c) != 1) {
+            return i;
+        }
+        out[i] = (char)c;
+    }
+
+    return i;
 }
 
 int serve(stlink_t *sl, st_state_t *st) {
@@ -1001,7 +1093,7 @@ int serve(stlink_t *sl, st_state_t *st) {
         DLOG("recv: %s\n", packet);
 
         char* reply = NULL;
-        reg regp;
+        struct stlink_reg regp;
 
         switch(packet[0]) {
             case 'q': {
@@ -1017,7 +1109,7 @@ int serve(stlink_t *sl, st_state_t *st) {
                     params = separator + 1;
                 }
 
-                unsigned queryNameLength = (separator - &packet[1]);
+                unsigned queryNameLength = (unsigned int) (separator - &packet[1]);
                 char* queryName = calloc(queryNameLength + 1, 1);
                 strncpy(queryName, &packet[1], queryNameLength);
 
@@ -1025,8 +1117,8 @@ int serve(stlink_t *sl, st_state_t *st) {
 
                 if(!strcmp(queryName, "Supported")) {
                     if(sl->chip_id==STLINK_CHIPID_STM32_F4
-		       || sl->chip_id==STLINK_CHIPID_STM32_F4_HD
-		       || sl->chip_id==STLINK_CHIPID_STM32_F7) {
+                       || sl->chip_id==STLINK_CHIPID_STM32_F4_HD
+                       || sl->core_id==STM32F7_CORE_ID) {
                         reply = strdup("PacketSize=3fff;qXfer:memory-map:read+;qXfer:features:read+");
                     }
                     else {
@@ -1043,8 +1135,8 @@ int serve(stlink_t *sl, st_state_t *st) {
                     __s_addr   = strsep(&tok, ",");
                     s_length = tok;
 
-                    unsigned addr = strtoul(__s_addr, NULL, 16),
-                             length = strtoul(s_length, NULL, 16);
+                    unsigned addr = (unsigned int) strtoul(__s_addr, NULL, 16),
+                             length = (unsigned int) strtoul(s_length, NULL, 16);
 
                     DLOG("Xfer: type:%s;op:%s;annex:%s;addr:%d;length:%d\n",
                                 type, op, annex, addr, length);
@@ -1058,7 +1150,7 @@ int serve(stlink_t *sl, st_state_t *st) {
                         data = target_description_F4;
 
                     if(data) {
-                        unsigned data_length = strlen(data);
+                        unsigned data_length = (unsigned int) strlen(data);
                         if(addr + length > data_length)
                             length = data_length - addr;
 
@@ -1072,27 +1164,42 @@ int serve(stlink_t *sl, st_state_t *st) {
                     }
                 } else if(!strncmp(queryName, "Rcmd,",4)) {
                     // Rcmd uses the wrong separator
-                    char *separator = strstr(packet, ","), *params = "";
+                    separator = strstr(packet, ",");
+                    params = "";
                     if(separator == NULL) {
                         separator = packet + strlen(packet);
                     } else {
                         params = separator + 1;
                     }
 
+                    size_t hex_len = strlen(params);
+                    size_t alloc_size = (hex_len / 2) + 1;
+                    size_t cmd_len;
+                    char *cmd = malloc(alloc_size);
 
-                    if (!strncmp(params,"726573756d65",12)) {// resume
+                    if (cmd == NULL) {
+                        DLOG("Rcmd unhexify allocation error\n");
+                        break;
+                    }
+
+                    cmd_len = unhexify(params, cmd, alloc_size - 1);
+                    cmd[cmd_len] = 0;
+
+                    DLOG("unhexified Rcmd: '%s'\n", cmd);
+
+                    if (!strncmp(cmd, "resume", 6)) {// resume
                         DLOG("Rcmd: resume\n");
                         cache_sync(sl);
                         stlink_run(sl);
 
                         reply = strdup("OK");
-                    } else if (!strncmp(params,"68616c74",8)) { //halt
+                    } else if (!strncmp(cmd, "halt", 4)) { //halt
                         reply = strdup("OK");
 
                         stlink_force_debug(sl);
 
                         DLOG("Rcmd: halt\n");
-                    } else if (!strncmp(params,"6a7461675f7265736574",20)) { //jtag_reset
+                    } else if (!strncmp(cmd, "jtag_reset", 10)) { //jtag_reset
                         reply = strdup("OK");
 
                         stlink_jtag_reset(sl, 0);
@@ -1100,7 +1207,7 @@ int serve(stlink_t *sl, st_state_t *st) {
                         stlink_force_debug(sl);
 
                         DLOG("Rcmd: jtag_reset\n");
-                    } else if (!strncmp(params,"7265736574",10)) { //reset
+                    } else if (!strncmp(cmd, "reset", 5)) { //reset
                         reply = strdup("OK");
 
                         stlink_force_debug(sl);
@@ -1109,10 +1216,32 @@ int serve(stlink_t *sl, st_state_t *st) {
                         init_data_watchpoints(sl);
 
                         DLOG("Rcmd: reset\n");
-                    } else {
-                        DLOG("Rcmd: %s\n", params);
-                    }
+                    } else if (!strncmp(cmd, "semihosting ", 12)) {
+                        DLOG("Rcmd: got semihosting cmd '%s'", cmd);
+                        char *arg = cmd + 12;
 
+                        /* Skip whitespaces */
+                        while (isspace(*arg)) {
+                            arg++;
+                        }
+
+                        if (!strncmp(arg, "enable", 6)
+                            || !strncmp(arg, "1", 1))
+                        {
+                            semihosting = true;
+                            reply = strdup("OK");
+                        } else if (!strncmp(arg, "disable", 7)
+                            || !strncmp(arg, "0", 1))
+                        {
+                            semihosting = false;
+                            reply = strdup("OK");
+                        } else {
+                            DLOG("Rcmd: unknown semihosting arg: '%s'\n", arg);
+                        }
+                    } else {
+                        DLOG("Rcmd: %s\n", cmd);
+                    }
+                    free(cmd);
                 }
 
                 if(reply == NULL)
@@ -1136,8 +1265,8 @@ int serve(stlink_t *sl, st_state_t *st) {
                     __s_addr   = strsep(&tok, ",");
                     s_length = tok;
 
-                    unsigned addr = strtoul(__s_addr, NULL, 16),
-                             length = strtoul(s_length, NULL, 16);
+                    unsigned addr = (unsigned int) strtoul(__s_addr, NULL, 16),
+                             length = (unsigned int) strtoul(s_length, NULL, 16);
 
                     DLOG("FlashErase: addr:%08x,len:%04x\n",
                                 addr, length);
@@ -1154,8 +1283,8 @@ int serve(stlink_t *sl, st_state_t *st) {
                     __s_addr = strsep(&tok, ":");
                     data   = tok;
 
-                    unsigned addr = strtoul(__s_addr, NULL, 16);
-                    unsigned data_length = status - (data - packet);
+                    unsigned addr = (unsigned int) strtoul(__s_addr, NULL, 16);
+                    unsigned data_length = status - (unsigned int) (data - packet);
 
                     // Length of decoded data cannot be more than
                     // encoded, as escapes are removed.
@@ -1205,7 +1334,7 @@ int serve(stlink_t *sl, st_state_t *st) {
                 stlink_run(sl);
 
                 while(1) {
-                    int status = gdb_check_for_interrupt(client);
+                    status = gdb_check_for_interrupt(client);
                     if(status < 0) {
                         ELOG("cannot check for int: %d\n", status);
 #ifdef __MINGW32__
@@ -1221,7 +1350,55 @@ int serve(stlink_t *sl, st_state_t *st) {
 
                     stlink_status(sl);
                     if(sl->core_stat == STLINK_CORE_HALTED) {
-                        break;
+                        struct stlink_reg reg;
+                        int ret;
+                        stm32_addr_t pc;
+                        stm32_addr_t addr;
+                        int offset = 0;
+                        uint16_t insn;
+
+                        if (!semihosting) {
+                            break;
+                        }
+
+                        stlink_read_all_regs (sl, &reg);
+
+                        /* Read PC */
+                        pc = reg.r[15];
+
+                        /* Compute aligned value */
+                        offset = pc % 4;
+                        addr = pc - offset;
+
+                        /* Read instructions (address and length must be
+                         * aligned).
+                         */
+                        ret = stlink_read_mem32(sl, addr, (offset > 2 ? 8 : 4));
+
+                        if (ret != 0) {
+                            DLOG("Semihost: cannot read instructions at: "
+                                 "0x%08x\n", addr);
+                            break;
+                        }
+
+                        memcpy(&insn, &sl->q_buf[offset], sizeof(insn));
+
+                        if (insn == 0xBEAB && !has_breakpoint(addr)) {
+
+                            do_semihosting (sl, reg.r[0], reg.r[1], &reg.r[0]);
+
+                            /* Write return value */
+                            stlink_write_reg(sl, reg.r[0], 0);
+
+                            /* Jump over the break instruction */
+                            stlink_write_reg(sl, reg.r[15] + 2, 15);
+
+                            /* continue execution */
+                            cache_sync(sl);
+                            stlink_run(sl);
+                        } else {
+                            break;
+                        }
                     }
 
                     usleep(100000);
@@ -1256,7 +1433,7 @@ int serve(stlink_t *sl, st_state_t *st) {
                 break;
 
             case 'p': {
-                unsigned id = strtoul(&packet[1], NULL, 16);
+                unsigned id = (unsigned int) strtoul(&packet[1], NULL, 16);
                 unsigned myreg = 0xDEADDEAD;
 
                 if(id < 16) {
@@ -1303,8 +1480,8 @@ int serve(stlink_t *sl, st_state_t *st) {
                 char* s_reg = &packet[1];
                 char* s_value = strstr(&packet[1], "=") + 1;
 
-                unsigned reg   = strtoul(s_reg,   NULL, 16);
-                unsigned value = strtoul(s_value, NULL, 16);
+                unsigned reg   = (unsigned int) strtoul(s_reg,   NULL, 16);
+                unsigned value = (unsigned int) strtoul(s_value, NULL, 16);
 
                 if(reg < 16) {
                     stlink_write_reg(sl, ntohl(value), reg);
@@ -1341,7 +1518,7 @@ int serve(stlink_t *sl, st_state_t *st) {
                 for(int i = 0; i < 16; i++) {
                     char str[9] = {0};
                     strncpy(str, &packet[1 + i * 8], 8);
-                    uint32_t reg = strtoul(str, NULL, 16);
+                    uint32_t reg = (uint32_t) strtoul(str, NULL, 16);
                     stlink_write_reg(sl, ntohl(reg), i);
                 }
 
@@ -1352,19 +1529,22 @@ int serve(stlink_t *sl, st_state_t *st) {
                 char* s_start = &packet[1];
                 char* s_count = strstr(&packet[1], ",") + 1;
 
-                stm32_addr_t start = strtoul(s_start, NULL, 16);
-                unsigned     count = strtoul(s_count, NULL, 16);
+                stm32_addr_t start = (stm32_addr_t) strtoul(s_start, NULL, 16);
+                unsigned     count = (unsigned int) strtoul(s_count, NULL, 16);
 
                 unsigned adj_start = start % 4;
                 unsigned count_rnd = (count + adj_start + 4 - 1) / 4 * 4;
                 if (count_rnd > sl->flash_pgsz)
-                    count_rnd = sl->flash_pgsz;
+                    count_rnd = (unsigned int) sl->flash_pgsz;
                 if (count_rnd > 0x1800)
                     count_rnd = 0x1800;
                 if (count_rnd < count)
                     count = count_rnd;
 
-                stlink_read_mem32(sl, start - adj_start, count_rnd);
+                if (stlink_read_mem32(sl, start - adj_start, count_rnd) != 0) {
+                    /* read failed somehow, don't return stale buffer */
+                    count = 0;
+                }
 
                 reply = calloc(count * 2 + 1, 1);
                 for(unsigned int i = 0; i < count; i++) {
@@ -1380,18 +1560,19 @@ int serve(stlink_t *sl, st_state_t *st) {
                 char* s_count = strstr(&packet[1], ",") + 1;
                 char* hexdata = strstr(packet, ":") + 1;
 
-                stm32_addr_t start = strtoul(s_start, NULL, 16);
-                unsigned     count = strtoul(s_count, NULL, 16);
+                stm32_addr_t start = (stm32_addr_t) strtoul(s_start, NULL, 16);
+                unsigned     count = (unsigned int) strtoul(s_count, NULL, 16);
+                int err = 0;
 
                 if(start % 4) {
                     unsigned align_count = 4 - start % 4;
                     if (align_count > count) align_count = count;
                     for(unsigned int i = 0; i < align_count; i ++) {
-                        char hex[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
-                        uint8_t byte = strtoul(hex, NULL, 16);
+                        char hextmp[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
+                        uint8_t byte = strtoul(hextmp, NULL, 16);
                         sl->q_buf[i] = byte;
                     }
-                    stlink_write_mem8(sl, start, align_count);
+                    err |= stlink_write_mem8(sl, start, align_count);
                     cache_change(start, align_count);
                     start += align_count;
                     count -= align_count;
@@ -1402,11 +1583,11 @@ int serve(stlink_t *sl, st_state_t *st) {
                     unsigned aligned_count = count - count % 4;
 
                     for(unsigned int i = 0; i < aligned_count; i ++) {
-                        char hex[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
-                        uint8_t byte = strtoul(hex, NULL, 16);
+                        char hextmp[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
+                        uint8_t byte = strtoul(hextmp, NULL, 16);
                         sl->q_buf[i] = byte;
                     }
-                    stlink_write_mem32(sl, start, aligned_count);
+                    err |= stlink_write_mem32(sl, start, aligned_count);
                     cache_change(start, aligned_count);
                     count -= aligned_count;
                     start += aligned_count;
@@ -1415,21 +1596,21 @@ int serve(stlink_t *sl, st_state_t *st) {
 
                 if(count) {
                     for(unsigned int i = 0; i < count; i ++) {
-                        char hex[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
-                        uint8_t byte = strtoul(hex, NULL, 16);
+                        char hextmp[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
+                        uint8_t byte = strtoul(hextmp, NULL, 16);
                         sl->q_buf[i] = byte;
                     }
-                    stlink_write_mem8(sl, start, count);
+                    err |= stlink_write_mem8(sl, start, count);
                     cache_change(start, count);
                 }
-                reply = strdup("OK");
+                reply = strdup(err ? "E00" : "OK");
                 break;
             }
 
             case 'Z': {
                 char *endptr;
-                stm32_addr_t addr = strtoul(&packet[3], &endptr, 16);
-                stm32_addr_t len  = strtoul(&endptr[1], NULL, 16);
+                stm32_addr_t addr = (stm32_addr_t) strtoul(&packet[3], &endptr, 16);
+                stm32_addr_t len  = (stm32_addr_t) strtoul(&endptr[1], NULL, 16);
 
                 switch (packet[1]) {
                     case '1':
@@ -1467,7 +1648,7 @@ int serve(stlink_t *sl, st_state_t *st) {
             }
             case 'z': {
                 char *endptr;
-                stm32_addr_t addr = strtoul(&packet[3], &endptr, 16);
+                stm32_addr_t addr = (stm32_addr_t) strtoul(&packet[3], &endptr, 16);
                 //stm32_addr_t len  = strtoul(&endptr[1], NULL, 16);
 
                 switch (packet[1]) {
@@ -1522,6 +1703,27 @@ int serve(stlink_t *sl, st_state_t *st) {
 
                 break;
             }
+            case 'k':
+                /* Kill request - reset the connection itself */
+                stlink_run(sl);
+                stlink_exit_debug_mode(sl);
+                stlink_close(sl);
+
+                sl = do_connect(st);
+                if(sl == NULL) cleanup(0);
+                connected_stlink = sl;
+
+                if (st->reset) {
+                    stlink_reset(sl);
+                }
+                stlink_force_debug(sl);
+                init_cache(sl);
+                init_code_breakpoints(sl);
+                init_data_watchpoints(sl);
+
+                reply = NULL;		/* no response */
+
+                break;
 
             default:
                 reply = strdup("");
